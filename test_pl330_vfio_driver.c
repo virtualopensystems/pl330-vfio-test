@@ -11,6 +11,60 @@
 
 #include <sys/fcntl.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
+
+#include <time.h>
+
+#define IRQ
+
+static void vfio_irqfd_clean(int device, unsigned int index)
+{
+    struct vfio_irq_set irq_set = {
+		.argsz = sizeof(irq_set),
+		.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+		.index = index,
+		.start = 0,
+		.count = 0,
+	};
+
+	int ret = ioctl(device, VFIO_DEVICE_SET_IRQS, &irq_set);
+
+	if (ret) {
+		printf("Failure in %s for IRQ %d\n", __func__, index);
+		exit(1);
+	}
+}
+
+static void vfio_irqfd_init(int device, unsigned int index, int fd)
+{
+	struct vfio_irq_set *irq_set;
+	int32_t *pfd;
+	int ret, argsz;
+
+	argsz = sizeof(*irq_set) + sizeof(*pfd);
+	irq_set = malloc(argsz);
+
+	if (!irq_set) {
+		printf("Failure in %s allocating memory\n", __func__);
+		exit(1);
+	}
+
+	irq_set->argsz = argsz;
+	irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
+	irq_set->index = index;
+	irq_set->start = 0;
+	irq_set->count = 1;
+	pfd = (int32_t *)&irq_set->data;
+	*pfd = fd;
+
+	ret = ioctl(device, VFIO_DEVICE_SET_IRQS, irq_set);
+	free(irq_set);
+
+	if (ret) {
+		printf("Failure in %s for IRQ %d\n", __func__, index);
+		exit(1);
+	}
+}
 
 int main(int argc, char **argv)
 {
@@ -143,22 +197,102 @@ int main(int argc, char **argv)
 	if (base_regs != MAP_FAILED)
 		printf("  - Successful MMAP to address %p\n", base_regs);
 
+#ifdef IRQ
+	struct vfio_irq_info irq = { .argsz = sizeof(irq) };
+	struct vfio_irq_set set = { .argsz = sizeof(set) };
+
+	irq.index = 0;
+
+	ret = ioctl(device, VFIO_DEVICE_GET_IRQ_INFO, &irq);
+
+	if (ret) {
+		printf("Couldn't get IRQ %d info\n", irq.index);
+		return 1;
+	}
+
+	printf("- IRQ %d: range of %d, flags=0x%x\n",
+			irq.index,
+			irq.count,
+			irq.flags );
+
+	// Let's play with that interrupt a bit
+	unsigned long long int e;
+
+	int irqfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (irqfd < 0)
+		return 1;
+	vfio_irqfd_init(device, irq.index, irqfd);
+
+	// we should get 0 triggered interrupts
+	ret = read(irqfd, &e, sizeof(e));
+	if (ret != -1 || errno != EAGAIN) {
+		printf("IRQ %d shouldn't trigger yet.", irq.index);
+		return 1;
+	}
+#endif
+
 	int *src_ptr = (int *)dma_map_src.vaddr;
 	int *dst_ptr = (int *)dma_map_dst.vaddr;
 
 	*src_ptr = 0xDEADBEEF;
 	*dst_ptr = 0x00000000;
 
+	// fill with random data
+	int c;
+	int tot = dma_map_src.size/sizeof(*src_ptr);
+	srand(time(NULL));
+	for(c = 0; c < tot; c++) {
+		src_ptr[c] = rand();
+	}
+
 	printf("source value: 0x%x\n", *src_ptr);
 	printf("destination value: 0x%x\n", *dst_ptr);
 
-	pl330_vfio_mem2mem_int(base_regs, (uchar *)dma_map_inst.vaddr, dma_map_inst.iova,
-						dma_map_src.iova, dma_map_dst.iova);
+	/*pl330_vfio_mem2mem_int(base_regs, (uchar *)dma_map_inst.vaddr, dma_map_inst.iova,*/
+						/*dma_map_src.iova, dma_map_dst.iova);*/
+
+
+	struct req_config config;
+	pl330_vfio_mem2mem_defconfig(&config);
+
+	config.iova_src = dma_map_src.iova;
+	config.iova_dst = dma_map_dst.iova;
+	config.size 	= dma_map_src.size;
+
+	generate_cmds_from_request((uchar *)dma_map_inst.vaddr, &config);
+
+	// enable int for first thread
+	int int_reg;
+	int_reg = *((uint *)&base_regs[INTEN]);
+	*((uint *)&base_regs[INTEN]) |= int_reg | (1 << 0);
+
+	pl330_vfio_submit_req(base_regs, (uchar *)dma_map_inst.vaddr, dma_map_inst.iova);
+	/* 
+	 * /!\/!\/!\	the interrupt should happen more or less here...   /!\/!\/!\
+	 *
+	 * */
+
+	printf("tot iters: %d\n", tot); 
+	for(c = 0; c < tot; c++) {
+		if(src_ptr[c] != dst_ptr[c]) {
+			printf("test failed! - %d - 0x%x - 0x%x\n", c, src_ptr[c], dst_ptr[c]);
+		}
+	}
+
 	/*
 	 * check result
 	 */
 	printf("source value: 0x%x\n", *((uint *)src_ptr));
 	printf("destination value: 0x%x\n", *((uint *)dst_ptr));
+
+#ifdef IRQ
+	ret = read(irqfd, &e, sizeof(e));
+	printf("IRQ %d has triggered %d times", irq.index, ret);
+
+	vfio_irqfd_clean(device, irq.index);
+
+	close(irqfd);
+#endif
 
 	return 0;
 }

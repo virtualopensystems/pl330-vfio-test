@@ -62,8 +62,7 @@ static void pl330_vfio_req_config_init(struct req_config *config)
 	config->config_ops.set_burst_length = pl330_set_burst_length;
 }
 
-static void apply_CCR_config(struct req_config *config, uint *reg)
-{
+static void apply_CCR_config(struct req_config *config, uint *reg) {
 
 }
 
@@ -126,7 +125,7 @@ static inline uint insert_DMALP(uchar *buffer, enum DMA_LOOP_REGISTER type,
 			error(-1, EINVAL, "insert_DMALP()");
 	}
 
-	buffer[1] = count;
+	buffer[1] = count - 1;
 
 	DEBUG_MSG("DMALP LOOP_CNT_%d_REG, count: %d\n", type, count);
 	
@@ -147,14 +146,20 @@ static inline uint insert_DMALPEND(uchar *buffer, enum LOOP_START_TYPE type,
 	switch(type) {
 		case BY_DMALP: 
 			// TODO add "forever" support
+			// set by dmalp
 			buffer[0] |= 1 << 4;
 			// set dma loop register
 			buffer[0] |= type << 2;
 
-			if (args->type == SINGLE) {
+			switch(args->type) {
+			case SINGLE:
 				buffer[0] |= (0 << 1) | (1 << 0);
-			} else if (args->type == BURST) {
+			case BURST:
 				buffer[0] |= (1 << 1) | (1 << 0);
+			case ALWAYS:
+				break;
+			default:
+				error(-1, EINVAL, "insert_DMALPEND(), type error");
 			}
 
 			buffer[1] = args->backflip_jump;
@@ -169,12 +174,14 @@ static inline uint insert_DMALPEND(uchar *buffer, enum LOOP_START_TYPE type,
 	return DMALPEND_SIZE;
 }
 
+// TODO SINGLE and BURST cases
 static inline uint insert_DMALD(uchar *buf)
 {
 	buf[0] = DMALD;
 	return DMALD_SIZE;
 }
 
+// TODO SINGLE and BURST cases
 static inline uint insert_DMAST(uchar *buf)
 {
 	buf[0] = DMAST;
@@ -205,6 +212,18 @@ static inline uint insert_DMAGO(uchar *buf, uchar channel,
 	return DMAGO_SIZE;
 }
 
+static inline uint insert_DMASEV(uchar *buf, uchar event) 
+{
+	buf[0] = DMASEV;
+
+	event &= 0x1f;
+	buf[1] = (event << 3); // see page 4-15
+
+	DEBUG_MSG("DMASEV event: %d\n", event);
+
+	return DMASEV_SIZE;
+}
+
 static inline void submit_to_DBGINST(uchar *dbg_instrs, uchar* base_regs)
 {
 	uint val;
@@ -219,10 +238,6 @@ static inline void submit_to_DBGINST(uchar *dbg_instrs, uchar* base_regs)
 	*((uint *)(base_regs + DBGCMD)) = 0;
 }
 
-
-
-
-
 static bool is_dmac_idle(const uchar *regs)
 {
 	if (*((uint *)(regs + DBGSTATUS)) & DBG_BUSY_MASK) {
@@ -236,8 +251,6 @@ static void build_cmds(uchar *buffer)
 {
 
 }
-
-
 
 static inline void pl330_vfio_build_CCR(uint * ccr, struct req_config *config)
 {
@@ -268,6 +281,172 @@ static void pl330_vfio_dma_map_init(struct vfio_iommu_type1_dma_map *map,
 	map->flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
 }
 
+static void setup_load_store(uchar *buf, uint *offset, enum transfer_type t_type)
+{
+	switch(t_type) {
+	case MEM2MEM: // TODO handle different design revision
+		*offset += insert_DMALD(&buf[*offset]);
+		*offset += insert_DMARMB(&buf[*offset]);
+		*offset += insert_DMAST(&buf[*offset]);
+		*offset += insert_DMAWMB(&buf[*offset]);
+		break;
+	case MEM2DEV: // TODO
+	case DEV2MEM: // TODO
+	default:
+		error(-1, EINVAL, "setup_load_store");
+	}
+}
+
+static uint add_inner_outer_loops(uchar *buf, uint *offset, uint in_cnt,
+					uint out_cnt, enum transfer_type t_type)
+{
+	int out_off, in_off = 0;
+	struct args_DMALPEND args;
+
+	if(out_cnt > 1) {
+		// outer loop : LOOP_CNT_1_REG
+		*offset += insert_DMALP(&buf[*offset], LOOP_CNT_1_REG, out_cnt);
+		out_off = *offset;	
+		DEBUG_MSG("        outer_loop_off:%u, cnt: %u\n", out_off, out_cnt);
+	}
+	// inner loop : LOOP_CNT_0_REG
+	*offset += insert_DMALP(&buf[*offset], LOOP_CNT_0_REG, in_cnt);
+	in_off = *offset;
+	DEBUG_MSG("        inner_loop_off:%u, cnt: %u\n", in_off, in_cnt);
+
+	/*
+	 * Load&Store operations
+	 * */
+	setup_load_store(buf, offset, t_type); 
+
+	// insert end of inner loop
+	args.type = ALWAYS;
+	args.loop_cnt_num = LOOP_CNT_0_REG;
+	args.backflip_jump = *offset - in_off;
+	*offset += insert_DMALPEND(&buf[*offset], LOOP_CNT_0_REG, &args);
+	DEBUG_MSG("        inner_loop_end:%u, backjmp: %d\n", *offset, args.backflip_jump);
+	
+	if(out_cnt > 1) {
+		args.type = ALWAYS;
+		args.loop_cnt_num = LOOP_CNT_1_REG;
+		args.backflip_jump = *offset - out_off;
+		*offset += insert_DMALPEND(&buf[*offset], BY_DMALP, &args);
+		DEBUG_MSG("        outer_loop_end:%u, backjmp: %d\n", *offset, args.backflip_jump);
+	}
+}
+
+static int setup_req_loops(uchar *buf_cmds, uint *offset, uint burst_size, uint burst_len, uint size,
+								enum transfer_type t_type)
+{
+	/*
+	 * full loop means two nested loop of
+	 * 256 iterations each
+	 * */
+	int full_loop_cnt = 0;
+	int full_loop_len = 65536; // 256*256
+
+	unsigned long remaining_burst = 0;
+
+	/* 
+	 * size has to be aligned with the amount of data
+	 * moved every burst
+	 * */
+	if(size % (burst_size * burst_len)) {
+		return -1;
+	}
+	unsigned long burst_count = NUM_OF_BURST(size,
+				burst_len, burst_size);
+
+	DEBUG_MSG("set up loops:\n");
+	DEBUG_MSG("    burst_cnt:%lu\n", burst_count);
+
+	full_loop_cnt = burst_count / full_loop_len;
+	remaining_burst = burst_count % full_loop_len;
+
+	DEBUG_MSG("    full_loop_cnt:%u\n", full_loop_cnt);
+	DEBUG_MSG("    remaining_burst:%lu\n", remaining_burst);
+
+	while(full_loop_cnt--) {
+		add_inner_outer_loops(buf_cmds, offset, 256, 256, t_type);	
+	}
+
+	// there could be n < 256*256 bursts left
+	// TODO add loop to handle more than one full loop 
+	if(remaining_burst >= 256) {
+		add_inner_outer_loops(buf_cmds, offset, 256, remaining_burst/256, t_type);
+		remaining_burst %= 256;
+		DEBUG_MSG("    remaining_burst_1:%lu\n", remaining_burst);
+	}
+
+	// there could be n < 256 bursts left
+	if(remaining_burst) {
+		add_inner_outer_loops(buf_cmds, offset, remaining_burst, 0, t_type);
+	}
+	
+	return 0;
+}
+
+/*
+ * insert required commands to set up the request.
+ * */
+int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config)
+{
+	uint offset = 0;
+
+	uint ccr_conf = 0;
+	pl330_vfio_build_CCR(&ccr_conf, config);
+
+	// add instructions to configure CCR, SAR and DAR
+	offset += insert_DMAMOV(cmds_buf, CCR, ccr_conf);
+	offset += insert_DMAMOV(&cmds_buf[offset], SAR, config->iova_src);
+	offset += insert_DMAMOV(&cmds_buf[offset], DAR, config->iova_dst);
+	
+	// set up loops, if any TODO handle src and dst burst size/length
+	if (setup_req_loops(cmds_buf, &offset, config->src_burst_size,
+			config->src_burst_len, config->size, config->t_type)) {
+		return -1;
+	}
+
+	// enable interrupts for the only supported thread
+	offset += insert_DMASEV(&cmds_buf[offset], 0);
+
+	// terminate transaction
+	offset += insert_DMAEND(&cmds_buf[offset]);
+}
+
+int pl330_vfio_mem2mem_defconfig(struct req_config *config)
+{
+	pl330_vfio_req_config_init(config);
+
+	config->src_inc = config->dst_inc = INC_DEF_VAL;
+	config->src_prot_ctrl = config->dst_prot_ctrl = CCR_PROTCTRL_DEF_VAL;
+	config->src_cache_ctrl = config->dst_cache_ctrl = CCR_CACHECTRL_DEF_VAL;
+
+	config->src_burst_size = config->dst_burst_size = CCR_BURSTSIZE_MAX;
+	config->src_burst_len = config->dst_burst_len = CCR_BURSTLEN_MAX;
+
+	config->t_type = MEM2MEM;
+}
+
+int pl330_vfio_submit_req(uchar *regs, uchar *cmds, u64 iova_cmds)
+{
+	if(!is_dmac_idle(regs)) {
+		return -1;
+	}
+
+	uchar ins_debug[6] = {0, 0, 0, 0, 0, 0};
+	
+	uchar channel_id = 0;
+	bool non_secure = true;
+
+	insert_DMAGO(ins_debug, channel_id, iova_cmds,
+			non_secure);
+
+	submit_to_DBGINST(ins_debug, regs); 
+
+	return 0;
+}
+
 int pl330_vfio_mem2mem_int(uchar *regs, uchar *cmds, u64 iova_cmds,
 					u64 iova_src, u64 iova_dst)
 {
@@ -276,10 +455,11 @@ int pl330_vfio_mem2mem_int(uchar *regs, uchar *cmds, u64 iova_cmds,
 	pl330_vfio_req_config_init(&config);
 
 	config.src_inc = config.dst_inc = INC_DEF_VAL;
-	config.src_burst_size = config.dst_burst_size = CCR_BURSTSIZE_DEF_VAL;
 	config.src_prot_ctrl = config.dst_prot_ctrl = CCR_PROTCTRL_DEF_VAL;
 	config.src_cache_ctrl = config.dst_cache_ctrl = CCR_CACHECTRL_DEF_VAL;
+	config.t_type = MEM2MEM;
 
+	config.size = 4; // int size
 	config.src_burst_size = config.dst_burst_size = 4;
 	config.src_burst_len = config.dst_burst_len = 1;
 

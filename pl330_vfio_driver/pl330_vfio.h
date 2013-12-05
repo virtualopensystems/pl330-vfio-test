@@ -34,8 +34,6 @@
 #define DBGINST0		0xD08
 #define DBGINST1		0xD0C
 
-
-
 /*
  * Commands encoding
  */
@@ -98,6 +96,12 @@
 #define DMAGO_SIZE		6
 
 /*
+ * DMASEV
+ * */
+#define DMASEV			0x034
+#define DMASEV_SIZE		2
+
+/*
  * Channel Control Register - CCR
  */
 #define DST_SHIFT		14
@@ -137,6 +141,8 @@
 #define DEBUG_MSG(fmt, ...) do {} while(0)
 #endif
 
+#define NUM_OF_BURST(tot, b_len, b_size)	((tot) / (b_len) / (b_size))
+
 typedef __u8 uchar;
 typedef __u32 uint;
 typedef __u64 u64;
@@ -163,6 +169,12 @@ enum request_type {
 	ALWAYS,
 };
 
+enum transfer_type {
+	MEM2MEM,
+	MEM2DEV,
+	DEV2MEM,
+};
+
 struct controller_config {
 	bool non_secure_mode;
 };
@@ -187,6 +199,12 @@ struct req_config {
 	// source and destination
 	__u64 iova_src;
 	__u64 iova_dst;
+
+	// bytes to transfer
+	int size;
+
+	// type of the transfer (mem to mem, mem to dev, dev to mem)
+	enum transfer_type t_type;
 
 	/*
 	 * channel configuration
@@ -220,6 +238,27 @@ struct req_config {
 };
 
 /*
+ * fill config with default value for a mem2mem transfer:
+ * It will set:
+ * 	config_ops
+ * 	src_inc, dst_inc at def val
+ * 	src_cache_ctrl, dst_cache_ctrl at def val
+ * 	src_burst_size, dst_burst_size at max
+ * 	src_burst_len, dst_burst_len at max
+ *	t_type = MEM2MEM
+ *
+ *	Remember that iova_src, iova_dst and size
+ *	are still to be set
+ * */
+int pl330_vfio_mem2mem_defconfig(struct req_config *config);
+
+/*
+ * fill the buffer with the instructions needed to realize
+ * the transfer configured by config
+ * */
+int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config);
+
+/*
  * handy function to test mem to mem transactions
  *
  * cmds has to point to a memory area accessible by the device and
@@ -228,5 +267,11 @@ struct req_config {
  *
  * */
 int pl330_vfio_mem2mem_int(uchar *regs, uchar *cmds, u64 iova_cmds, u64 iova_src, u64 iova_dst);
+
+/*
+ * Tell to the controller where the instructions are
+ * and instruct it to go
+ * */
+int pl330_vfio_submit_req(uchar *regs, uchar *cmds, u64 iova_cmds);
 
 #endif
