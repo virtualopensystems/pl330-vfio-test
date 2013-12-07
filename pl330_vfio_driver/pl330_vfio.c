@@ -8,11 +8,12 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <string.h>
 
 #include <sys/mman.h>
 #include <sys/eventfd.h>
 #include <sys/fcntl.h>
-
+#include <sys/select.h>
 
 static int pl330_set_burst_size(uint val, enum dst_src type, uint *reg)
 {
@@ -247,9 +248,50 @@ static bool is_dmac_idle(const uchar *regs)
 	}
 }
 
-static void build_cmds(uchar *buffer)
+void pl330_vfio_init(uchar *base_regs)
 {
+	status = malloc(sizeof(struct pl330_status));
+	
+	if(status) {
+		memset(status, 0, sizeof(struct pl330_status));
+	}
+	else {
+		error(-1, EINVAL, "error during init");
+	}
 
+	status->regs = base_regs;
+
+	FD_ZERO(&status->set_irq_efd);
+	status->highest_irq_num = 0;
+	status->efdnum_irqnum = g_hash_table_new_full(g_int_hash, g_int_equal,
+								free, free);
+}
+
+/*
+ * add new irq to the triggering set.
+ * vfio_irq_index is not the irq hw number
+ * */
+int pl330_vfio_add_irq(int eventfd_irq, int vfio_irq_index)
+{
+	int *efd_ptr = NULL;
+	int *irq_idx_ptr = NULL;
+
+	if(FD_ISSET(eventfd_irq, &(status->set_irq_efd))) {
+		return -1;
+	}
+	FD_SET(eventfd_irq, &status->set_irq_efd);
+
+	efd_ptr = malloc(sizeof(*efd_ptr));
+	*efd_ptr = eventfd_irq;
+	irq_idx_ptr = malloc(sizeof(*irq_idx_ptr));
+	*irq_idx_ptr = vfio_irq_index;
+
+	g_hash_table_insert(status->efdnum_irqnum, efd_ptr,
+						irq_idx_ptr);
+
+	if(eventfd_irq > status->highest_irq_num) {
+		status->highest_irq_num = eventfd_irq;
+	}
 }
 
 static inline void pl330_vfio_build_CCR(uint * ccr, struct req_config *config)
@@ -414,6 +456,7 @@ int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config)
 	offset += insert_DMAEND(&cmds_buf[offset]);
 }
 
+
 int pl330_vfio_mem2mem_defconfig(struct req_config *config)
 {
 	pl330_vfio_req_config_init(config);
@@ -428,8 +471,10 @@ int pl330_vfio_mem2mem_defconfig(struct req_config *config)
 	config->t_type = MEM2MEM;
 }
 
-int pl330_vfio_submit_req(uchar *regs, uchar *cmds, u64 iova_cmds)
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds)
 {
+	uchar *regs = status->regs;
+
 	if(!is_dmac_idle(regs)) {
 		return -1;
 	}
@@ -447,12 +492,13 @@ int pl330_vfio_submit_req(uchar *regs, uchar *cmds, u64 iova_cmds)
 	return 0;
 }
 
-int pl330_vfio_mem2mem_int(uchar *regs, uchar *cmds, u64 iova_cmds,
+int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds,
 					u64 iova_src, u64 iova_dst)
 {
 	int offset = 0;
 	struct req_config config;
 	pl330_vfio_req_config_init(&config);
+	uchar *regs = status->regs;
 
 	config.src_inc = config.dst_inc = INC_DEF_VAL;
 	config.src_prot_ctrl = config.dst_prot_ctrl = CCR_PROTCTRL_DEF_VAL;
@@ -495,4 +541,86 @@ int pl330_vfio_mem2mem_int(uchar *regs, uchar *cmds, u64 iova_cmds,
 	submit_to_DBGINST(ins_debug, regs); 
 
 	return 0;
+}
+
+static void set_triggered_mask(gpointer key, gpointer val, gpointer mask)
+{
+	if(FD_ISSET(*(int *)key, &status->set_irq_efd)) {
+		*(int *)mask |= (1 << *(int *)val);
+	}
+}
+
+static void enable_clear_from_triggered_mask(gpointer key, gpointer val, gpointer mask)
+{
+	if(!FD_ISSET(*(int *)key, &status->set_irq_efd)) {
+		FD_SET(*(int *)key, &status->set_irq_efd);
+	} else {
+		FD_CLR(*(int *)key, &status->set_irq_efd);
+		// clear irq
+		pl330_vfio_clear_irq(*(int *)val);	
+	}
+}
+
+static void *irq_handler_func(void *arg)
+{
+	int *irq_num;
+	int efd_num;
+	int irq_triggered_mask = 0;
+
+	while (1) {
+		/*
+		 * waiting for I/O, in this case for the notification
+		 * of an interrupt
+		 * */
+		efd_num = select(status->highest_irq_num + 1, &status->set_irq_efd,
+								NULL, NULL, NULL);
+		printf("TRIGGER!\n");
+		/*
+		 * Create a mask with all triggered interrupts, and then clear them.
+		 * It could be done with only one g_hash_table_foreach TODO, but for
+		 * now we keep in this way.
+		 * */
+		g_hash_table_foreach(status->efdnum_irqnum, set_triggered_mask,
+							&irq_triggered_mask);
+		g_hash_table_foreach(status->efdnum_irqnum, enable_clear_from_triggered_mask,
+							&irq_triggered_mask);
+		// all interrupts now should be cleared
+		irq_triggered_mask = 0;
+		/*
+		 * notify the user now
+		 * */
+	}
+}
+
+void pl330_vfio_start_irq_handler()
+{
+	int ret;
+
+	ret = pthread_create(&status->irq_handler, NULL, irq_handler_func, NULL);
+	
+	if(ret) {
+		error(-1, "unable to create irq thread");
+	}
+}
+
+void pl330_vfio_clear_irq(int irq_num)
+{
+	uint *int_reg = (uint *)(status->regs + INTEN);
+	uint *cl_irq_reg = (uint *)(status->regs + INTCLR);	
+
+	if(*int_reg & (1 << irq_num)) {
+		// clear it
+		*cl_irq_reg = (1 << irq_num);	
+	}
+}
+
+void pl330_vfio_remove()
+{
+	// clear all interrups
+	uint *int_reg = (uint *)(status->regs + INTCLR);
+	*int_reg = 0;
+
+	pthread_cancel(status->irq_handler);
+
+	free(status);
 }

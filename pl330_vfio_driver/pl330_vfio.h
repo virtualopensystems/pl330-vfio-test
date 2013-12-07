@@ -1,8 +1,11 @@
 #ifndef PL330_VFIO_H
 #define PL330_VFIO_H
 
-#include <linux/types.h>
 #include <stdbool.h>
+#include <glib.h>
+#include <pthread.h>
+#include <linux/types.h>
+#include <sys/select.h>
 
 /*
  * Register offset
@@ -10,7 +13,9 @@
 #define DSR			0x000
 #define DPC			0x004
 #define INTEN			0x020
+#define INT_EVENT_RIS		0x024
 #define INTMIS			0x028
+#define INTCLR			0x02C
 #define CSR_BASE		0x100
 #define CSR(n)			(CSR_BASE + (n)*0x8) // n = 0:7
 #define CPC_BASE		0x104
@@ -237,6 +242,25 @@ struct req_config {
 	struct req_config_ops config_ops;
 };
 
+struct pl330_status {
+	uchar * regs; // pointer to the first pl330 register
+	fd_set set_irq_efd;
+	int highest_irq_num;
+	pthread_t irq_handler;
+	/*
+	 * key is eventfd number
+	 * value is irqnumber
+	 * */
+	GHashTable *efdnum_irqnum;
+};
+
+struct pl330_status *status;
+
+/*
+ * init the controller
+ * */
+void pl330_vfio_init(uchar *base_regs);
+
 /*
  * fill config with default value for a mem2mem transfer:
  * It will set:
@@ -266,12 +290,24 @@ int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config);
  * For such a transaction only, 1KB is more than enough.
  *
  * */
-int pl330_vfio_mem2mem_int(uchar *regs, uchar *cmds, u64 iova_cmds, u64 iova_src, u64 iova_dst);
+int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds, u64 iova_src, u64 iova_dst);
 
 /*
  * Tell to the controller where the instructions are
  * and instruct it to go
  * */
-int pl330_vfio_submit_req(uchar *regs, uchar *cmds, u64 iova_cmds);
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds);
 
+void pl330_vfio_start_irq_handler();
+int pl330_vfio_add_irq(int eventfd_irq, int vfio_irq_index);
+
+/*
+ * Clear interrupt number num
+ * */
+void pl330_vfio_clear_irq(int irq_num);
+
+/*
+ * Unload driver
+ * */
+void pl330_vfio_remove();
 #endif

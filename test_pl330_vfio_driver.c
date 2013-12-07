@@ -221,12 +221,18 @@ int main(int argc, char **argv)
 	int irqfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 	if (irqfd < 0)
 		return 1;
+
 	vfio_irqfd_init(device, irq.index, irqfd);
+
+	// init the controller before adding irq
+	pl330_vfio_init(base_regs);
+	// add the irq to the pl330 controller
+	pl330_vfio_add_irq(irqfd, irq.index);
 
 	// we should get 0 triggered interrupts
 	ret = read(irqfd, &e, sizeof(e));
 	if (ret != -1 || errno != EAGAIN) {
-		printf("IRQ %d shouldn't trigger yet.", irq.index);
+		printf("IRQ %d shouldn't trigger yet.\n", irq.index);
 		return 1;
 	}
 #endif
@@ -251,6 +257,10 @@ int main(int argc, char **argv)
 	/*pl330_vfio_mem2mem_int(base_regs, (uchar *)dma_map_inst.vaddr, dma_map_inst.iova,*/
 						/*dma_map_src.iova, dma_map_dst.iova);*/
 
+	printf("start thread\n");
+
+	// irq handler after setting up irqs
+	pl330_vfio_start_irq_handler();
 
 	struct req_config config;
 	pl330_vfio_mem2mem_defconfig(&config);
@@ -266,12 +276,14 @@ int main(int argc, char **argv)
 	int_reg = *((uint *)&base_regs[INTEN]);
 	*((uint *)&base_regs[INTEN]) |= int_reg | (1 << 0);
 
-	pl330_vfio_submit_req(base_regs, (uchar *)dma_map_inst.vaddr, dma_map_inst.iova);
-	/* 
-	 * /!\/!\/!\	the interrupt should happen more or less here...   /!\/!\/!\
-	 *
-	 * */
+	pl330_vfio_submit_req((uchar *)dma_map_inst.vaddr, dma_map_inst.iova);
 
+	/*
+	 * wait for the interrupt TODO 
+	 * The check could fail now, because the controller
+	 * could not have finished its job yet.
+	 * BTW, never failed to me.
+	 */
 	printf("tot iters: %d\n", tot); 
 	for(c = 0; c < tot; c++) {
 		if(src_ptr[c] != dst_ptr[c]) {
@@ -285,6 +297,7 @@ int main(int argc, char **argv)
 	printf("source value: 0x%x\n", *((uint *)src_ptr));
 	printf("destination value: 0x%x\n", *((uint *)dst_ptr));
 
+	// halt controller: check the various thread are finished and remove TODO
 #ifdef IRQ
 	ret = read(irqfd, &e, sizeof(e));
 	printf("IRQ %d has triggered %d times", irq.index, ret);
