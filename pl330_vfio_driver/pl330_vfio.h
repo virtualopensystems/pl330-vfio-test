@@ -11,6 +11,8 @@
  * Register offset
  * */
 #define DSR			0x000
+#define DSR_STATUS_SHIFT	0
+#define DSR_STATUS_MASK		0x00F
 #define DPC			0x004
 #define INTEN			0x020
 #define INT_EVENT_RIS		0x024
@@ -18,6 +20,8 @@
 #define INTCLR			0x02C
 #define CSR_BASE		0x100
 #define CSR(n)			(CSR_BASE + (n)*0x8) // n = 0:7
+#define CSR_CHANNEL_STATUS_SH	0
+#define CSR_CHANNEL_STATUS_MK	0x00F
 #define CPC_BASE		0x104
 #define CPC(n)			(CPC_BASE + (n)*0x8) // n = 0:7
 #define SAR_BASE		0x400
@@ -31,13 +35,43 @@
 #define LC1_BASE		0x410
 #define LC1(n) 			(LC1_BASE + (n)*0x8) // n = 0:7 
 #define CR_BASE			0xE00
-#define CR(n)			(CR_BASE  + (n)*0x8) // n = 0:4
+#define CR(n)			(CR_BASE  + (n)*0x4) // n = 0:4
+#define CR0_PERIF_REQ_SUPP	(1 << 0)
+#define CR0_NUM_CHANNELS_SH	4
+#define CR0_NUM_CHANNELS_MK	0x007
+#define CR0_NUM_PERIF_REQ_SH	12
+#define CR0_NUM_PERIF_REQ_MK	0x01F
+#define CR0_NUM_EVENT_SHIFT	17
+#define CR0_NUM_EVENT_MASK	0x01F
 #define CRD			0xE14
+#define CRD_BUS_WIDTH_SHIFT	0
+#define CRD_BUS_WIDTH_MASK	0x007
+#define CRD_BUF_DEPTH_SHIFT	20
+#define CRD_BUF_DEPTH_MASK	0x3FF
 #define DBGSTATUS		0xD00
 #define DBG_BUSY_MASK		(1 << 0)
 #define DBGCMD			0xD04
 #define DBGINST0		0xD08
 #define DBGINST1		0xD0C
+
+#define	shift_and_mask(a, x, y)	(((a) >> (x)) & (y))
+
+/*
+ * Available states encoding
+ * */
+#define STOPPED			0x000
+#define EXECUTING		0x001
+#define CACHE_MISS		0x002
+#define UPDATING_PC		0x003
+#define WAIT_EVENT		0x004
+#define BARRIER			0x005
+#define WAIT_PERIPH		0x007
+#define KILLING			0x008
+#define COMPLETING		0x009
+#define FAULT_COMPLETING	0x00E
+#define FAULTING		0x00F
+
+#define INVALID_STATE		0x010
 
 /*
  * Commands encoding
@@ -107,6 +141,12 @@
 #define DMASEV_SIZE		2
 
 /*
+ * DMAKILL
+ * */
+#define DMAKILL			0x001
+#define DMAKILL_SIZE		1
+
+/*
  * Channel Control Register - CCR
  */
 #define DST_SHIFT		14
@@ -147,6 +187,15 @@
 #endif
 
 #define NUM_OF_BURST(tot, b_len, b_size)	((tot) / (b_len) / (b_size))
+
+/*
+ * IDs
+ *
+ * The channels IDs are 0,1,...,status->channels
+ * Since there could be 8 channels maximum, the manager
+ * thread ID is 8
+ * */
+#define MANAGER_ID		8
 
 typedef __u8 uchar;
 typedef __u32 uint;
@@ -242,7 +291,30 @@ struct req_config {
 	struct req_config_ops config_ops;
 };
 
+enum channel_thread_state {
+	FREE,
+	ALLOCATED,
+};
+
+struct channel_thread {
+	enum channel_thread_state state; 
+	/*
+	 * event to fire when the transfer completes
+	 * */
+	int event_id;
+};
+
 struct pl330_status {
+	uint channels; // # of channels available
+	struct channel_thread *ch_threads;
+
+	/*
+	 * the controller supports 32 events.
+	 * The envent i is allocated if
+	 * allocated_events[i] == 1
+	 * */
+	uint allocated_events;
+
 	uchar * regs; // pointer to the first pl330 register
 	fd_set set_irq_efd;
 	int highest_irq_num;
@@ -283,6 +355,12 @@ int pl330_vfio_mem2mem_defconfig(struct req_config *config);
 int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config);
 
 /*
+ * TODO describe
+ * */
+int pl330_vfio_request_channel();
+void pl330_vfio_release_channel(uint id);
+
+/*
  * handy function to test mem to mem transactions
  *
  * cmds has to point to a memory area accessible by the device and
@@ -296,7 +374,7 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds, u64 iova_src, u64 iova_ds
  * Tell to the controller where the instructions are
  * and instruct it to go
  * */
-int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds);
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id);
 
 void pl330_vfio_start_irq_handler();
 int pl330_vfio_add_irq(int eventfd_irq, int vfio_irq_index);
@@ -305,6 +383,12 @@ int pl330_vfio_add_irq(int eventfd_irq, int vfio_irq_index);
  * Clear interrupt number num
  * */
 void pl330_vfio_clear_irq(int irq_num);
+
+/*
+ * For every available channel, check if it's in stopped state; if it's not,
+ * force it to move into it. Stop also the manager thread.
+ * */
+void pl330_vfio_reset();
 
 /*
  * Unload driver

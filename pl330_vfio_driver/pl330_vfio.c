@@ -63,8 +63,48 @@ static void pl330_vfio_req_config_init(struct req_config *config)
 	config->config_ops.set_burst_length = pl330_set_burst_length;
 }
 
-static void apply_CCR_config(struct req_config *config, uint *reg) {
+struct CR0_conf {
+	bool perif_req_support;
+	uint num_channels;
+	uint num_perif_req;
+	uint num_events;
+};
 
+static void CR0_read_conf(struct CR0_conf *conf)
+{
+	uint cr0_reg;
+
+	cr0_reg = *((uint *)(status->regs + CR(0)));
+
+	conf->perif_req_support = (cr0_reg & CR0_PERIF_REQ_SUPP) ? true : false;
+
+	conf->num_channels =  shift_and_mask(cr0_reg,
+			CR0_NUM_CHANNELS_SH, CR0_NUM_CHANNELS_MK) + 1;
+
+	conf->num_perif_req = shift_and_mask(cr0_reg,
+			CR0_NUM_PERIF_REQ_SH, CR0_NUM_PERIF_REQ_MK) + 1;
+
+	conf->num_events = shift_and_mask(cr0_reg,
+			CR0_NUM_EVENT_SHIFT, CR0_NUM_EVENT_MASK) + 1;
+}
+
+struct CRD_conf {
+	uint bus_width;
+	uint buf_depth;
+};
+
+static void CRD_read_conf(struct CRD_conf *conf)
+{
+	uint crd_reg, tmp;
+
+	crd_reg = *((uint *)(status->regs + CRD));
+
+	tmp = shift_and_mask(crd_reg,
+			CRD_BUS_WIDTH_SHIFT, CRD_BUS_WIDTH_MASK);
+	conf->bus_width = 8 * (1 << tmp);
+
+	conf->buf_depth = shift_and_mask(crd_reg,
+			CRD_BUF_DEPTH_SHIFT, CRD_BUF_DEPTH_MASK) + 1;
 }
 
 /*
@@ -225,23 +265,34 @@ static inline uint insert_DMASEV(uchar *buf, uchar event)
 	return DMASEV_SIZE;
 }
 
-static inline void submit_to_DBGINST(uchar *dbg_instrs, uchar* base_regs)
+static inline uint insert_DMAKILL(uchar *buf)
+{
+	buf[0] = DMAKILL;
+
+	return DMAKILL_SIZE;
+}
+
+static inline void submit_to_DBGINST(uchar *dbg_instrs, uint thread_id)
 {
 	uint val;
 
 	val = (dbg_instrs[0] << 16) | (dbg_instrs[1] << 24);
+	if(thread_id < MANAGER_ID) {
+		val |= (1 << 0);
+		val |= (thread_id << 8);
+	}
 
-	*((uint *)(base_regs + DBGINST0)) = val;
+	*((uint *)(status->regs + DBGINST0)) = val;
 
-	*((uint *)(base_regs + DBGINST1)) = *((uint *)&dbg_instrs[2]);
+	*((uint *)(status->regs + DBGINST1)) = *((uint *)&dbg_instrs[2]);
 
 	// GO
-	*((uint *)(base_regs + DBGCMD)) = 0;
+	*((uint *)(status->regs + DBGCMD)) = 0;
 }
 
-static bool is_dmac_idle(const uchar *regs)
+static bool is_dmac_idle()
 {
-	if (*((uint *)(regs + DBGSTATUS)) & DBG_BUSY_MASK) {
+	if (*((uint *)(status->regs + DBGSTATUS)) & DBG_BUSY_MASK) {
 		return false;
 	} else {
 		return true;
@@ -250,6 +301,15 @@ static bool is_dmac_idle(const uchar *regs)
 
 void pl330_vfio_init(uchar *base_regs)
 {
+	struct CRD_conf *crd_conf;
+	struct CR0_conf *cr0_conf;
+	int i;
+
+	crd_conf = malloc(sizeof(struct CRD_conf));
+	cr0_conf = malloc(sizeof(struct CR0_conf));
+	memset(crd_conf, 0, sizeof(struct CRD_conf));
+	memset(cr0_conf, 0, sizeof(struct CR0_conf));
+
 	status = malloc(sizeof(struct pl330_status));
 	
 	if(status) {
@@ -265,6 +325,23 @@ void pl330_vfio_init(uchar *base_regs)
 	status->highest_irq_num = 0;
 	status->efdnum_irqnum = g_hash_table_new_full(g_int_hash, g_int_equal,
 								free, free);
+
+	status->allocated_events = 0;
+
+	// grab number of channels available
+	CRD_read_conf(crd_conf);
+	CR0_read_conf(cr0_conf);
+	
+	status->channels = cr0_conf->num_channels;
+	printf("device init, num channel: %d\n", status->channels);
+
+	status->ch_threads = malloc(status->channels*sizeof(struct channel_thread));
+	struct channel_thread free_state = {FREE, -1};
+	for(i = 0; i < status->channels; i++) {
+		status->ch_threads[i] = free_state;
+	}
+	// grab AXI master interface bus configuration TODO
+	// grab device buffer length TODO
 }
 
 /*
@@ -471,23 +548,20 @@ int pl330_vfio_mem2mem_defconfig(struct req_config *config)
 	config->t_type = MEM2MEM;
 }
 
-int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds)
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id)
 {
-	uchar *regs = status->regs;
-
-	if(!is_dmac_idle(regs)) {
+	if(!is_dmac_idle()) {
 		return -1;
 	}
 
 	uchar ins_debug[6] = {0, 0, 0, 0, 0, 0};
 	
-	uchar channel_id = 0;
 	bool non_secure = true;
 
 	insert_DMAGO(ins_debug, channel_id, iova_cmds,
 			non_secure);
 
-	submit_to_DBGINST(ins_debug, regs); 
+	submit_to_DBGINST(ins_debug, MANAGER_ID); 
 
 	return 0;
 }
@@ -498,7 +572,6 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds,
 	int offset = 0;
 	struct req_config config;
 	pl330_vfio_req_config_init(&config);
-	uchar *regs = status->regs;
 
 	config.src_inc = config.dst_inc = INC_DEF_VAL;
 	config.src_prot_ctrl = config.dst_prot_ctrl = CCR_PROTCTRL_DEF_VAL;
@@ -526,7 +599,7 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds,
 
 	offset += insert_DMAEND(&cmds[offset]);
 
-	if (!is_dmac_idle(regs)) {
+	if (!is_dmac_idle()) {
 		return -1;
 	}
 
@@ -538,7 +611,7 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds,
 	insert_DMAGO(ins_debug, channel_id, iova_cmds,
 			non_secure);
 
-	submit_to_DBGINST(ins_debug, regs); 
+	submit_to_DBGINST(ins_debug, MANAGER_ID); 
 
 	return 0;
 }
@@ -611,6 +684,125 @@ void pl330_vfio_clear_irq(int irq_num)
 	if(*int_reg & (1 << irq_num)) {
 		// clear it
 		*cl_irq_reg = (1 << irq_num);	
+	}
+}
+
+static uint thread_state(uint id)
+{
+	uint state_reg, state;
+	if(id == MANAGER_ID) {
+		state_reg = *((uint *)(status->regs + DSR));
+		state = shift_and_mask(state_reg,
+				DSR_STATUS_SHIFT, DSR_STATUS_MASK);
+		switch(state) {
+		case STOPPED:
+		case EXECUTING:
+		case CACHE_MISS:
+		case UPDATING_PC:
+		case WAIT_EVENT:
+		case FAULTING:
+			return state;
+		default:
+			return INVALID_STATE;
+		}
+	} else {
+		state_reg = *((uint *)(status->regs + CSR(id)));
+		state = shift_and_mask(state_reg,
+				CSR_CHANNEL_STATUS_SH, CSR_CHANNEL_STATUS_MK);
+		switch(state) {
+		case STOPPED:
+		case EXECUTING:
+		case CACHE_MISS:
+		case UPDATING_PC:
+		case WAIT_EVENT:
+		case BARRIER:
+		case WAIT_PERIPH:
+		case KILLING:
+		case COMPLETING:
+		case FAULT_COMPLETING:
+		case FAULTING:
+			return state;
+		default:
+			return INVALID_STATE;
+		}
+	}
+}
+
+static void stop_thread(uint id)
+{
+	uchar ins_debug[6] = {0, 0, 0, 0, 0, 0};
+	uint int_reg, state;
+
+	if(id > MANAGER_ID) {
+		error(-1, "invalid channel id");
+	}
+
+	state = thread_state(id);
+	if(state == INVALID_STATE) {
+		error(-1, "invalid state");
+	}
+
+	switch(state) {
+		case STOPPED:
+		case KILLING:
+		case COMPLETING:
+			printf("thread %d already stopped\n", id);
+			// nothing to do
+			return;
+		default:
+			break;
+	}
+
+	// stop interrupt for channel id
+	int_reg = *((uint *)(status->regs + INTEN));
+	*((uint *)(status->regs + INTEN)) = int_reg
+		& ~(1 << status->ch_threads[id].event_id);
+	printf("closing event %d for thread %d", status->ch_threads[id].event_id, id);
+
+	insert_DMAKILL(ins_debug);
+
+	submit_to_DBGINST(ins_debug, id);
+}
+
+int pl330_vfio_request_channel()
+{
+	int i;
+	int ret = -1;
+
+	for(i = 0; i <= status->channels; i++) {
+		if(status->ch_threads[i].state == FREE) {
+			ret = i;
+			if(status->allocated_events & (1 << i)) {
+				// the event is already allocated
+				error(-1, "event already allocated");
+			}
+			status->ch_threads[i].state = ALLOCATED;
+			status->ch_threads[i].event_id = i;
+			status->allocated_events |= (1 << i);
+			break;
+		}
+	}
+	printf("allocated thread %d\n", ret);
+	return ret;
+}
+
+void pl330_vfio_release_channel(uint id)
+{
+	status->allocated_events &= ~(1 << id);
+	status->ch_threads[id].state = FREE;
+	status->ch_threads[id].event_id = -1;
+}
+
+void pl330_vfio_reset()
+{
+	int i;
+
+	// stop the manager
+	stop_thread(MANAGER_ID);
+
+	// stop all the channels
+	for(i = 0; i < status->channels; i++) {
+		stop_thread(i);
 	}
 }
 

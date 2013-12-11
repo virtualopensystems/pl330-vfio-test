@@ -271,12 +271,21 @@ int main(int argc, char **argv)
 
 	generate_cmds_from_request((uchar *)dma_map_inst.vaddr, &config);
 
-	// enable int for first thread
+	int channel_id;
+	channel_id = pl330_vfio_request_channel();
+	if(channel_id < 0) {
+		printf("fail! No channels available!\n");
+		return -1;
+	} else {
+		printf("channel %d allocated\n", channel_id);
+	}
+
+	// enable int for first thread TODO move this inside the driver
 	int int_reg;
 	int_reg = *((uint *)&base_regs[INTEN]);
-	*((uint *)&base_regs[INTEN]) |= int_reg | (1 << 0);
+	*((uint *)&base_regs[INTEN]) |= int_reg | (1 << channel_id);
 
-	pl330_vfio_submit_req((uchar *)dma_map_inst.vaddr, dma_map_inst.iova);
+	pl330_vfio_submit_req((uchar *)dma_map_inst.vaddr, dma_map_inst.iova, channel_id);
 
 	/*
 	 * wait for the interrupt TODO 
@@ -284,12 +293,18 @@ int main(int argc, char **argv)
 	 * could not have finished its job yet.
 	 * BTW, never failed to me.
 	 */
+	sleep(1);
+
+	pl330_vfio_release_channel(channel_id);
+
 	printf("tot iters: %d\n", tot); 
 	for(c = 0; c < tot; c++) {
 		if(src_ptr[c] != dst_ptr[c]) {
 			printf("test failed! - %d - 0x%x - 0x%x\n", c, src_ptr[c], dst_ptr[c]);
 		}
 	}
+
+	pl330_vfio_reset();
 
 	/*
 	 * check result
