@@ -2,8 +2,6 @@
 
 #include <linux/vfio.h>
 #include <linux/types.h>
-#include <linux/vfio.h>
-#include <linux/vfio.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +14,10 @@
 #include <time.h>
 
 #define IRQ
+
+#define VFIO_CONTAINER "/dev/vfio/vfio"
+
+#define VFIO_DMA_MAP_FLAG_EXEC		(1 << 2)
 
 static void vfio_irqfd_clean(int device, unsigned int index)
 {
@@ -77,7 +79,7 @@ int main(int argc, char **argv)
 	struct vfio_iommu_type1_dma_map dma_map_src = { .argsz = sizeof(dma_map_src) };
 	// destination memory area the DMA controller will read to
 	struct vfio_iommu_type1_dma_map dma_map_dst = { .argsz = sizeof(dma_map_dst) };
-	/* 
+	/*
 	 * memory area where the DMA controller will grub the instructions
 	 * to execute. We will tell to the controller how to reach these
 	 * instructions through the DEBUG registers.
@@ -94,7 +96,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Create a new container */
-	container = open("/dev/vfio/vfio", O_RDWR);
+	container = open(VFIO_CONTAINER, O_RDWR);
 
 	if (ioctl(container, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
 		printf("Unknown API version\n");
@@ -130,26 +132,29 @@ int main(int argc, char **argv)
 	int size_to_map = getpagesize();
 
 	// source map for the dma copy
-	dma_map_src.vaddr = (u64)mmap(NULL, size_to_map, PROT_READ | PROT_WRITE,
-			     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	dma_map_src.vaddr = (u64)((uintptr_t)mmap(NULL, size_to_map, PROT_READ | PROT_WRITE,
+			     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0));
 	dma_map_src.size = size_to_map;
 	dma_map_src.iova = 0;
-	dma_map_src.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+	dma_map_src.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE
+						   | VFIO_DMA_MAP_FLAG_EXEC;
 
 	// destination map for the dma copy
-	dma_map_dst.vaddr = (u64)mmap(NULL, size_to_map, PROT_READ | PROT_WRITE,
-			     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	dma_map_dst.vaddr = (u64)((uintptr_t)mmap(NULL, size_to_map, PROT_READ | PROT_WRITE,
+			     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0));
 	dma_map_dst.size = size_to_map;
 	dma_map_dst.iova = dma_map_src.size;
-	dma_map_dst.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+	dma_map_dst.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE
+						   | VFIO_DMA_MAP_FLAG_EXEC;
 
 	// memory which stores the commands executed by the dma controller
 	int cmds_len = size_to_map;
-	dma_map_inst.vaddr = (u64)mmap(NULL, cmds_len, PROT_READ | PROT_WRITE,
-			     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	dma_map_inst.vaddr = (u64)((uintptr_t)mmap(NULL, cmds_len, PROT_READ | PROT_WRITE,
+			     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0));
 	dma_map_inst.size = cmds_len;
 	dma_map_inst.iova = dma_map_src.size + dma_map_dst.size;
-	dma_map_inst.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE;
+	dma_map_inst.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE
+						    | VFIO_DMA_MAP_FLAG_EXEC;
 
 	ret = ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map_src);
 	ret |= ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map_dst);
@@ -237,8 +242,8 @@ int main(int argc, char **argv)
 	}
 #endif
 
-	int *src_ptr = (int *)dma_map_src.vaddr;
-	int *dst_ptr = (int *)dma_map_dst.vaddr;
+	int *src_ptr = (int *)((uintptr_t)dma_map_src.vaddr);
+	int *dst_ptr = (int *)((uintptr_t)dma_map_dst.vaddr);
 
 	*src_ptr = 0xDEADBEEF;
 	*dst_ptr = 0x00000000;
@@ -268,8 +273,9 @@ int main(int argc, char **argv)
 	config.iova_src = dma_map_src.iova;
 	config.iova_dst = dma_map_dst.iova;
 	config.size 	= dma_map_src.size;
+	config.int_fin  = true;
 
-	generate_cmds_from_request((uchar *)dma_map_inst.vaddr, &config);
+	generate_cmds_from_request((uchar *)((uintptr_t)dma_map_inst.vaddr), &config);
 
 	int channel_id;
 	channel_id = pl330_vfio_request_channel();
@@ -278,17 +284,14 @@ int main(int argc, char **argv)
 		return -1;
 	} else {
 		printf("channel %d allocated\n", channel_id);
+		config.chan_id = channel_id;
 	}
 
-	// enable int for first thread TODO move this inside the driver
-	int int_reg;
-	int_reg = *((uint *)&base_regs[INTEN]);
-	*((uint *)&base_regs[INTEN]) |= int_reg | (1 << channel_id);
-
-	pl330_vfio_submit_req((uchar *)dma_map_inst.vaddr, dma_map_inst.iova, channel_id);
+	pl330_vfio_submit_req((uchar *)((uintptr_t)dma_map_inst.vaddr), dma_map_inst.iova,
+								channel_id, &config);
 
 	/*
-	 * wait for the interrupt TODO 
+	 * wait for the interrupt TODO
 	 * The check could fail now, because the controller
 	 * could not have finished its job yet.
 	 * BTW, never failed to me.
@@ -297,7 +300,7 @@ int main(int argc, char **argv)
 
 	pl330_vfio_release_channel(channel_id);
 
-	printf("tot iters: %d\n", tot); 
+	printf("tot iters: %d\n", tot);
 	for(c = 0; c < tot; c++) {
 		if(src_ptr[c] != dst_ptr[c]) {
 			printf("test failed! - %d - 0x%x - 0x%x\n", c, src_ptr[c], dst_ptr[c]);

@@ -264,16 +264,19 @@ struct req_config {
 	 * channel configuration
 	 */
 	// increment value
-	unsigned int src_inc;		
+	unsigned int src_inc;
 	unsigned int dst_inc;
 
 	// burst size
-	unsigned int src_burst_size; 	
+	unsigned int src_burst_size;
 	unsigned int dst_burst_size;
 
 	// burst length
-	unsigned int src_burst_len; 	
+	unsigned int src_burst_len;
 	unsigned int dst_burst_len;
+
+	// channel to which submit the request
+	unsigned int chan_id;
 
 	// prot control value, for now we set directly the value
 	/*
@@ -281,12 +284,15 @@ struct req_config {
 	bool privileged;
 	bool insnaccess;
 	*/
-	unsigned int src_prot_ctrl; 	
+	unsigned int src_prot_ctrl;
 	unsigned int dst_prot_ctrl;
 
 	// cache control value
-	unsigned int src_cache_ctrl;	
+	unsigned int src_cache_ctrl;
 	unsigned int dst_cache_ctrl;
+
+	// arise an interrupt when the transfer is completed
+	bool int_fin;
 
 	struct req_config_ops config_ops;
 };
@@ -297,7 +303,7 @@ enum channel_thread_state {
 };
 
 struct channel_thread {
-	enum channel_thread_state state; 
+	enum channel_thread_state state;
 	/*
 	 * event to fire when the transfer completes
 	 * */
@@ -374,7 +380,7 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds, u64 iova_src, u64 iova_ds
  * Tell to the controller where the instructions are
  * and instruct it to go
  * */
-int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id);
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id, struct req_config *conf);
 
 void pl330_vfio_start_irq_handler();
 int pl330_vfio_add_irq(int eventfd_irq, int vfio_irq_index);

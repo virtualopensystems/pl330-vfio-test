@@ -114,7 +114,7 @@ static void CRD_read_conf(struct CRD_conf *conf)
 static inline uchar ith_uchar(void *buf, int pos)
 {
 	uchar *ptr = buf + pos;
-	
+
 	return *ptr;
 }
 
@@ -169,7 +169,7 @@ static inline uint insert_DMALP(uchar *buffer, enum DMA_LOOP_REGISTER type,
 	buffer[1] = count - 1;
 
 	DEBUG_MSG("DMALP LOOP_CNT_%d_REG, count: %d\n", type, count);
-	
+
 	return DMALP_SIZE;
 }
 
@@ -185,7 +185,7 @@ static inline uint insert_DMALPEND(uchar *buffer, enum LOOP_START_TYPE type,
 	buffer[0] = DMALPEND;
 
 	switch(type) {
-		case BY_DMALP: 
+		case BY_DMALP:
 			// TODO add "forever" support
 			// set by dmalp
 			buffer[0] |= 1 << 4;
@@ -231,7 +231,7 @@ static inline uint insert_DMAST(uchar *buf)
 
 static inline uint insert_DMARMB(uchar *buf)
 {
-	buf[0] = DMARMB; 
+	buf[0] = DMARMB;
 	return DMARMB_SIZE;
 }
 
@@ -253,7 +253,7 @@ static inline uint insert_DMAGO(uchar *buf, uchar channel,
 	return DMAGO_SIZE;
 }
 
-static inline uint insert_DMASEV(uchar *buf, uchar event) 
+static inline uint insert_DMASEV(uchar *buf, uchar event)
 {
 	buf[0] = DMASEV;
 
@@ -311,7 +311,7 @@ void pl330_vfio_init(uchar *base_regs)
 	memset(cr0_conf, 0, sizeof(struct CR0_conf));
 
 	status = malloc(sizeof(struct pl330_status));
-	
+
 	if(status) {
 		memset(status, 0, sizeof(struct pl330_status));
 	}
@@ -331,7 +331,7 @@ void pl330_vfio_init(uchar *base_regs)
 	// grab number of channels available
 	CRD_read_conf(crd_conf);
 	CR0_read_conf(cr0_conf);
-	
+
 	status->channels = cr0_conf->num_channels;
 	printf("device init, num channel: %d\n", status->channels);
 
@@ -425,7 +425,7 @@ static uint add_inner_outer_loops(uchar *buf, uint *offset, uint in_cnt,
 	if(out_cnt > 1) {
 		// outer loop : LOOP_CNT_1_REG
 		*offset += insert_DMALP(&buf[*offset], LOOP_CNT_1_REG, out_cnt);
-		out_off = *offset;	
+		out_off = *offset;
 		DEBUG_MSG("        outer_loop_off:%u, cnt: %u\n", out_off, out_cnt);
 	}
 	// inner loop : LOOP_CNT_0_REG
@@ -436,7 +436,7 @@ static uint add_inner_outer_loops(uchar *buf, uint *offset, uint in_cnt,
 	/*
 	 * Load&Store operations
 	 * */
-	setup_load_store(buf, offset, t_type); 
+	setup_load_store(buf, offset, t_type);
 
 	// insert end of inner loop
 	args.type = ALWAYS;
@@ -444,7 +444,7 @@ static uint add_inner_outer_loops(uchar *buf, uint *offset, uint in_cnt,
 	args.backflip_jump = *offset - in_off;
 	*offset += insert_DMALPEND(&buf[*offset], LOOP_CNT_0_REG, &args);
 	DEBUG_MSG("        inner_loop_end:%u, backjmp: %d\n", *offset, args.backflip_jump);
-	
+
 	if(out_cnt > 1) {
 		args.type = ALWAYS;
 		args.loop_cnt_num = LOOP_CNT_1_REG;
@@ -466,7 +466,7 @@ static int setup_req_loops(uchar *buf_cmds, uint *offset, uint burst_size, uint 
 
 	unsigned long remaining_burst = 0;
 
-	/* 
+	/*
 	 * size has to be aligned with the amount of data
 	 * moved every burst
 	 * */
@@ -486,11 +486,11 @@ static int setup_req_loops(uchar *buf_cmds, uint *offset, uint burst_size, uint 
 	DEBUG_MSG("    remaining_burst:%lu\n", remaining_burst);
 
 	while(full_loop_cnt--) {
-		add_inner_outer_loops(buf_cmds, offset, 256, 256, t_type);	
+		add_inner_outer_loops(buf_cmds, offset, 256, 256, t_type);
 	}
 
 	// there could be n < 256*256 bursts left
-	// TODO add loop to handle more than one full loop 
+	// TODO add loop to handle more than one full loop
 	if(remaining_burst >= 256) {
 		add_inner_outer_loops(buf_cmds, offset, 256, remaining_burst/256, t_type);
 		remaining_burst %= 256;
@@ -501,7 +501,7 @@ static int setup_req_loops(uchar *buf_cmds, uint *offset, uint burst_size, uint 
 	if(remaining_burst) {
 		add_inner_outer_loops(buf_cmds, offset, remaining_burst, 0, t_type);
 	}
-	
+
 	return 0;
 }
 
@@ -519,15 +519,17 @@ int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config)
 	offset += insert_DMAMOV(cmds_buf, CCR, ccr_conf);
 	offset += insert_DMAMOV(&cmds_buf[offset], SAR, config->iova_src);
 	offset += insert_DMAMOV(&cmds_buf[offset], DAR, config->iova_dst);
-	
+
 	// set up loops, if any TODO handle src and dst burst size/length
 	if (setup_req_loops(cmds_buf, &offset, config->src_burst_size,
 			config->src_burst_len, config->size, config->t_type)) {
 		return -1;
 	}
 
-	// enable interrupts for the only supported thread
-	offset += insert_DMASEV(&cmds_buf[offset], 0);
+	if(config->int_fin) {
+		// enable interrupts for the only supported event
+		offset += insert_DMASEV(&cmds_buf[offset], 0);
+	}
 
 	// terminate transaction
 	offset += insert_DMAEND(&cmds_buf[offset]);
@@ -548,20 +550,32 @@ int pl330_vfio_mem2mem_defconfig(struct req_config *config)
 	config->t_type = MEM2MEM;
 }
 
-int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id)
+void enable_int_for_req(struct req_config *config)
+{
+	if(config->int_fin) {
+		uint int_reg;
+		int_reg = *((uint *)(status->regs + INTEN)) | (1 << config->chan_id);
+		(*((uint *)(status->regs + INTEN))) |= int_reg;
+	}
+}
+
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id, struct req_config *conf)
 {
 	if(!is_dmac_idle()) {
 		return -1;
 	}
 
+	// enable interrupt
+	enable_int_for_req(conf);
+
 	uchar ins_debug[6] = {0, 0, 0, 0, 0, 0};
-	
+
 	bool non_secure = true;
 
 	insert_DMAGO(ins_debug, channel_id, iova_cmds,
 			non_secure);
 
-	submit_to_DBGINST(ins_debug, MANAGER_ID); 
+	submit_to_DBGINST(ins_debug, MANAGER_ID);
 
 	return 0;
 }
@@ -783,6 +797,7 @@ int pl330_vfio_request_channel()
 		}
 	}
 	printf("allocated thread %d\n", ret);
+
 	return ret;
 }
 
