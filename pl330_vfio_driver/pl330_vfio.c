@@ -3,6 +3,7 @@
 #include <linux/types.h>
 #include <errno.h>
 #include <linux/vfio.h>
+#include <poll.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -14,6 +15,30 @@
 #include <sys/eventfd.h>
 #include <sys/fcntl.h>
 #include <sys/select.h>
+
+struct pl330_status {
+	uint channels; // # of channels available
+	struct channel_thread *ch_threads;
+
+	/*
+	 * the controller supports 32 events.
+	 * The envent i is allocated if
+	 * allocated_events[i] == 1
+	 * */
+	uint allocated_events;
+
+	uchar * regs; // pointer to the first pl330 register
+	fd_set set_irq_efd;
+	int highest_irq_num;
+	pthread_t irq_handler;
+	/*
+	 * key is eventfd number
+	 * value is irqnumber
+	 * */
+	GHashTable *efdnum_irqnum;
+};
+
+struct pl330_status *status = NULL;
 
 static int pl330_set_burst_size(uint val, enum dst_src type, uint *reg)
 {
@@ -527,8 +552,8 @@ int generate_cmds_from_request(uchar *cmds_buf, struct req_config *config)
 	}
 
 	if(config->int_fin) {
-		// enable interrupts for the only supported event
-		offset += insert_DMASEV(&cmds_buf[offset], 0);
+		// see the event enabled in enable_int_for_req()
+		offset += insert_DMASEV(&cmds_buf[offset], config->chan_id);
 	}
 
 	// terminate transaction
@@ -548,8 +573,14 @@ int pl330_vfio_mem2mem_defconfig(struct req_config *config)
 	config->src_burst_len = config->dst_burst_len = CCR_BURSTLEN_MAX;
 
 	config->t_type = MEM2MEM;
+
+	config->callback = NULL;
+	config->user_data = NULL;
 }
 
+/*
+ * For the channel num. i, we activate the event i
+ * */
 void enable_int_for_req(struct req_config *config)
 {
 	if(config->int_fin) {
@@ -559,7 +590,7 @@ void enable_int_for_req(struct req_config *config)
 	}
 }
 
-int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id, struct req_config *conf)
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, struct req_config *conf)
 {
 	if(!is_dmac_idle()) {
 		return -1;
@@ -572,8 +603,15 @@ int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id, struct re
 
 	bool non_secure = true;
 
-	insert_DMAGO(ins_debug, channel_id, iova_cmds,
+	insert_DMAGO(ins_debug, conf->chan_id, iova_cmds,
 			non_secure);
+
+	if(conf->int_fin) {
+		status->ch_threads[conf->chan_id].callback =
+					conf->callback;
+		status->ch_threads[conf->chan_id].user_data =
+					conf->user_data;
+	}
 
 	submit_to_DBGINST(ins_debug, MANAGER_ID);
 
@@ -618,33 +656,46 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds,
 	}
 
 	uchar ins_debug[6] = {0, 0, 0, 0, 0, 0};
-	
+
 	uchar channel_id = 0;
 	bool non_secure = true;
 
 	insert_DMAGO(ins_debug, channel_id, iova_cmds,
 			non_secure);
 
-	submit_to_DBGINST(ins_debug, MANAGER_ID); 
+	submit_to_DBGINST(ins_debug, MANAGER_ID);
 
 	return 0;
 }
 
-static void set_triggered_mask(gpointer key, gpointer val, gpointer mask)
+static void fdset_insert(gpointer key, gpointer val, gpointer nodata)
 {
-	if(FD_ISSET(*(int *)key, &status->set_irq_efd)) {
-		*(int *)mask |= (1 << *(int *)val);
-	}
+	// the key is the eventfd number
+	FD_SET(*((int *)key), &status->set_irq_efd);
 }
 
-static void enable_clear_from_triggered_mask(gpointer key, gpointer val, gpointer mask)
+static void restore_fdset()
 {
-	if(!FD_ISSET(*(int *)key, &status->set_irq_efd)) {
-		FD_SET(*(int *)key, &status->set_irq_efd);
-	} else {
-		FD_CLR(*(int *)key, &status->set_irq_efd);
+	FD_ZERO(&status->set_irq_efd);
+
+	g_hash_table_foreach(status->efdnum_irqnum, fdset_insert, NULL);
+}
+
+static void handle_trigger_fdset(gpointer key, gpointer val, gpointer mask)
+{
+	if(FD_ISSET(*(int *)key, &status->set_irq_efd)) {
 		// clear irq
-		pl330_vfio_clear_irq(*(int *)val);	
+		pl330_vfio_clear_irq(*(int *)val);
+		// restore eventfd
+		eventfd_t eval;
+		if(eventfd_read(*(int *)key, &eval)) {
+			error(-1, errno, "error while reading from eventfd");
+		}
+		// trigger callback
+		struct channel_thread *ch = &status->ch_threads[*(int *)val];
+		if(ch->callback != NULL) {
+			ch->callback(ch->user_data);
+		}
 	}
 }
 
@@ -662,20 +713,11 @@ static void *irq_handler_func(void *arg)
 		efd_num = select(status->highest_irq_num + 1, &status->set_irq_efd,
 								NULL, NULL, NULL);
 		printf("TRIGGER!\n");
-		/*
-		 * Create a mask with all triggered interrupts, and then clear them.
-		 * It could be done with only one g_hash_table_foreach TODO, but for
-		 * now we keep in this way.
-		 * */
-		g_hash_table_foreach(status->efdnum_irqnum, set_triggered_mask,
+
+		g_hash_table_foreach(status->efdnum_irqnum, handle_trigger_fdset,
 							&irq_triggered_mask);
-		g_hash_table_foreach(status->efdnum_irqnum, enable_clear_from_triggered_mask,
-							&irq_triggered_mask);
-		// all interrupts now should be cleared
-		irq_triggered_mask = 0;
-		/*
-		 * notify the user now
-		 * */
+
+		restore_fdset();
 	}
 }
 
@@ -684,7 +726,7 @@ void pl330_vfio_start_irq_handler()
 	int ret;
 
 	ret = pthread_create(&status->irq_handler, NULL, irq_handler_func, NULL);
-	
+
 	if(ret) {
 		error(-1, "unable to create irq thread");
 	}
@@ -693,11 +735,11 @@ void pl330_vfio_start_irq_handler()
 void pl330_vfio_clear_irq(int irq_num)
 {
 	uint *int_reg = (uint *)(status->regs + INTEN);
-	uint *cl_irq_reg = (uint *)(status->regs + INTCLR);	
+	uint *cl_irq_reg = (uint *)(status->regs + INTCLR);
 
 	if(*int_reg & (1 << irq_num)) {
 		// clear it
-		*cl_irq_reg = (1 << irq_num);	
+		*cl_irq_reg = (1 << irq_num);
 	}
 }
 

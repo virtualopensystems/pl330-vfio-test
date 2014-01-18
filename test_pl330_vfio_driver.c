@@ -68,6 +68,14 @@ static void vfio_irqfd_init(int device, unsigned int index, int fd)
 	}
 }
 
+void done_callback(void *user_data)
+{
+	printf("done!\n");
+
+	char *ptr = (char *)user_data;
+	printf("the message is: %s\n", ptr);
+}
+
 int main(int argc, char **argv)
 {
 	int container, group, device;
@@ -245,9 +253,6 @@ int main(int argc, char **argv)
 	int *src_ptr = (int *)((uintptr_t)dma_map_src.vaddr);
 	int *dst_ptr = (int *)((uintptr_t)dma_map_dst.vaddr);
 
-	*src_ptr = 0xDEADBEEF;
-	*dst_ptr = 0x00000000;
-
 	// fill with random data
 	int c;
 	int tot = dma_map_src.size/sizeof(*src_ptr);
@@ -259,9 +264,6 @@ int main(int argc, char **argv)
 	printf("source value: 0x%x\n", *src_ptr);
 	printf("destination value: 0x%x\n", *dst_ptr);
 
-	/*pl330_vfio_mem2mem_int(base_regs, (uchar *)dma_map_inst.vaddr, dma_map_inst.iova,*/
-						/*dma_map_src.iova, dma_map_dst.iova);*/
-
 	printf("start thread\n");
 
 	// irq handler after setting up irqs
@@ -272,10 +274,8 @@ int main(int argc, char **argv)
 
 	config.iova_src = dma_map_src.iova;
 	config.iova_dst = dma_map_dst.iova;
-	config.size 	= dma_map_src.size;
+	config.size	= dma_map_src.size;
 	config.int_fin  = true;
-
-	generate_cmds_from_request((uchar *)((uintptr_t)dma_map_inst.vaddr), &config);
 
 	int channel_id;
 	channel_id = pl330_vfio_request_channel();
@@ -287,20 +287,14 @@ int main(int argc, char **argv)
 		config.chan_id = channel_id;
 	}
 
+	config.callback = done_callback;
+	char msg[] = "transfer completed";
+	config.user_data = msg;
+
+	generate_cmds_from_request((uchar *)((uintptr_t)dma_map_inst.vaddr), &config);
 	pl330_vfio_submit_req((uchar *)((uintptr_t)dma_map_inst.vaddr), dma_map_inst.iova,
-								channel_id, &config);
+								&config);
 
-	/*
-	 * wait for the interrupt TODO
-	 * The check could fail now, because the controller
-	 * could not have finished its job yet.
-	 * BTW, never failed to me.
-	 */
-	sleep(1);
-
-	pl330_vfio_release_channel(channel_id);
-
-	printf("tot iters: %d\n", tot);
 	for(c = 0; c < tot; c++) {
 		if(src_ptr[c] != dst_ptr[c]) {
 			printf("test failed! - %d - 0x%x - 0x%x\n", c, src_ptr[c], dst_ptr[c]);
@@ -317,13 +311,13 @@ int main(int argc, char **argv)
 
 	// halt controller: check the various thread are finished and remove TODO
 #ifdef IRQ
-	ret = read(irqfd, &e, sizeof(e));
-	printf("IRQ %d has triggered %d times", irq.index, ret);
-
 	vfio_irqfd_clean(device, irq.index);
 
 	close(irqfd);
 #endif
 
+	pl330_vfio_release_channel(channel_id);
+
 	return 0;
 }
+

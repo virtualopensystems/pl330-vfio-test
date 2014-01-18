@@ -29,11 +29,11 @@
 #define DAR_BASE		0x404
 #define DAR(n)			(DAR_BASE + (n)*0x8) // n = 0:7
 #define CCR_BASE		0x408
-#define CCR(n)			(CCR_BASE + (n)*0x8) // n = 0:7 
+#define CCR(n)			(CCR_BASE + (n)*0x8) // n = 0:7
 #define LC0_BASE		0x40C
-#define LC0(n)			(LC0_BASE + (n)*0x8) // n = 0:7 
+#define LC0(n)			(LC0_BASE + (n)*0x8) // n = 0:7
 #define LC1_BASE		0x410
-#define LC1(n) 			(LC1_BASE + (n)*0x8) // n = 0:7 
+#define LC1(n)			(LC1_BASE + (n)*0x8) // n = 0:7
 #define CR_BASE			0xE00
 #define CR(n)			(CR_BASE  + (n)*0x4) // n = 0:4
 #define CR0_PERIF_REQ_SUPP	(1 << 0)
@@ -77,7 +77,7 @@
  * Commands encoding
  */
 
-/* 
+/*
  * DMAMOV
  */
 #define DMAMOV			0x0BC
@@ -89,14 +89,14 @@
 /*
  * DMAEND
  */
-#define DMAEND			0x000		
+#define DMAEND			0x000
 #define DMAEND_SIZE		1
 
 /*
  * DMALP
  */
 #define DMALP			0x020
-#define DMALP_SIZE		2		
+#define DMALP_SIZE		2
 
 /*
  * DMALPEND
@@ -151,37 +151,37 @@
  */
 #define DST_SHIFT		14
 
-#define CCR_SRCINC_SHIFT	0 		// source control
+#define CCR_SRCINC_SHIFT	0		// source control
 #define CCR_SRCBURSTSIZE_SHIFT	1
 #define CCR_SRCBURSTLEN_SHIFT	4
 #define CCR_SRCPROTCTRL_SHIFT	8
 #define CCR_SRCCACHECTRL_SHIFT	11
 
-#define CCR_DSTINC_SHIFT      	0  + DST_SHIFT 	// destination control
+#define CCR_DSTINC_SHIFT	0  + DST_SHIFT	// destination control
 #define CCR_DSTBURSTSIZE_SHIFT	1  + DST_SHIFT
-#define CCR_DSTBURSTLEN_SHIFT 	4  + DST_SHIFT
-#define CCR_DSTPROTCTRL_SHIFT 	8  + DST_SHIFT
+#define CCR_DSTBURSTLEN_SHIFT	4  + DST_SHIFT
+#define CCR_DSTPROTCTRL_SHIFT	8  + DST_SHIFT
 #define CCR_DSTCACHECTRL_SHIFT	11 + DST_SHIFT
 
 #define CCR_ENDIANSWAPSZ_SHIFT	28
 
 // default values
 #define INC_DEF_VAL		1
-#define CCR_PROTCTRL_DEF_VAL	(0 << 0) | (1 << 1) | (0 << 2)	
+#define CCR_PROTCTRL_DEF_VAL	(0 << 0) | (1 << 1) | (0 << 2)
 #define CCR_BURSTLEN_DEF_VAL	1
 #define CCR_BURSTSIZE_DEF_VAL	2
 #define CCR_CACHECTRL_DEF_VAL	0
 
 // CCR limit val
 #define CCR_BURSTSIZE_MAX	16 // bytes
-#define CCR_BURSTLEN_MAX 	16 // data transfers
+#define CCR_BURSTLEN_MAX	16 // data transfers
 
 #define DEBUG 1
 #ifdef DEBUG
 #define DEBUG_MSG(fmt, ...)				\
 	do {						\
 		printf("debug: "fmt, ##__VA_ARGS__);	\
-	} while(0)				
+	} while(0)
 #else
 #define DEBUG_MSG(fmt, ...) do {} while(0)
 #endif
@@ -294,6 +294,10 @@ struct req_config {
 	// arise an interrupt when the transfer is completed
 	bool int_fin;
 
+	// callback to be called when the request has been served
+	void (*callback)(void *user_data);
+	void *user_data;
+
 	struct req_config_ops config_ops;
 };
 
@@ -308,31 +312,11 @@ struct channel_thread {
 	 * event to fire when the transfer completes
 	 * */
 	int event_id;
+
+	// callback when finished
+	void (* callback)(void *user_data);
+	void *user_data;
 };
-
-struct pl330_status {
-	uint channels; // # of channels available
-	struct channel_thread *ch_threads;
-
-	/*
-	 * the controller supports 32 events.
-	 * The envent i is allocated if
-	 * allocated_events[i] == 1
-	 * */
-	uint allocated_events;
-
-	uchar * regs; // pointer to the first pl330 register
-	fd_set set_irq_efd;
-	int highest_irq_num;
-	pthread_t irq_handler;
-	/*
-	 * key is eventfd number
-	 * value is irqnumber
-	 * */
-	GHashTable *efdnum_irqnum;
-};
-
-struct pl330_status *status;
 
 /*
  * init the controller
@@ -380,7 +364,7 @@ int pl330_vfio_mem2mem_int(uchar *cmds, u64 iova_cmds, u64 iova_src, u64 iova_ds
  * Tell to the controller where the instructions are
  * and instruct it to go
  * */
-int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, uint channel_id, struct req_config *conf);
+int pl330_vfio_submit_req(uchar *cmds, u64 iova_cmds, struct req_config *conf);
 
 void pl330_vfio_start_irq_handler();
 int pl330_vfio_add_irq(int eventfd_irq, int vfio_irq_index);
